@@ -1,0 +1,51 @@
+{
+  "name": "pi-monitor-plugin",
+  "version": "0.1.0",
+  "description": "Background, monitor, loop, and schedule jobs for the pi coding agent, with idle-aware session notifications. Ships a skill that watches GitHub for PRs awaiting your review and notifies your session.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Walisson Casonatto <wdcasonatto@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shodocan/pi-monitor-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Shodocan/pi-monitor-plugin/issues"
+  },
+  "homepage": "https://github.com/Shodocan/pi-monitor-plugin#readme",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "background-jobs",
+    "monitoring",
+    "notifications",
+    "github"
+  ],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

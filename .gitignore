@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+
+# Build output (not used at runtime — pi loads .ts directly — but typecheck may emit)
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# TypeScript cache
+tsconfig.tsbuildinfo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Serena state
+.serena/
+
+# CodeGraph state
+.codegraph/
+
+# Git worktrees
+.worktrees/
+
+# Sensitive files - NEVER commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+secrets/
+credentials/
+*.credentials
+*.secret
+
+# Personal config
+.pi/settings.local.json
+runtime.env
+
+# Logs
+*.log
+logs/
+
+# Backup files
+*.bak
+*.backup
+
+# Temporary files
+tmp/
+temp/
+.cache/
