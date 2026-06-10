@@ -64,14 +64,7 @@ const CancelToolSchema = Type.Object({
 const ListToolSchema = Type.Object({});
 
 type BackgroundToolParams = Static<typeof BackgroundToolSchema>;
-type MonitorToolParams = {
-  command: string;
-  regex: string;
-  before?: number;
-  after?: number;
-  debounceSeconds?: number;
-  deliver?: string;
-};
+type MonitorToolParams = Static<typeof MonitorToolSchema>;
 type LoopToolParams = Static<typeof LoopToolSchema>;
 type ScheduleToolParams = Static<typeof ScheduleToolSchema>;
 type CancelToolParams = Static<typeof CancelToolSchema>;
