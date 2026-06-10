@@ -99,13 +99,17 @@ describe('extension registration', () => {
     expect(commandNames).toContain('cancel');
   });
 
-  it('registers two AI tools', () => {
+  it('registers six AI tools', () => {
     extension(api);
 
-    expect(api.registerTool).toHaveBeenCalledTimes(2);
+    expect(api.registerTool).toHaveBeenCalledTimes(6);
     const toolNames = (api.registerTool as ReturnType<typeof vi.fn>).mock.calls.map((args: any[]) => args[0].name);
     expect(toolNames).toContain('jobs_background');
     expect(toolNames).toContain('jobs_monitor');
+    expect(toolNames).toContain('jobs_loop');
+    expect(toolNames).toContain('jobs_schedule');
+    expect(toolNames).toContain('jobs_list');
+    expect(toolNames).toContain('jobs_cancel');
   });
 
   it('background tool schema has required fields', () => {
@@ -175,15 +179,32 @@ describe('command handlers', () => {
     extension(api);
   });
 
-  it('stub commands notify about scaffolding', async () => {
-    const stubNames = ['loop', 'schedule', 'jobs', 'cancel'];
-    for (const name of stubNames) {
-      const handler = (api.registerCommand as ReturnType<typeof vi.fn>).mock.calls.find(
-        (c: any[]) => c[0] === name,
-      )![1].handler;
-      await handler('', ctx);
-      expect(ctx.ui.notify).toHaveBeenCalled();
-    }
+  it('loop command starts a loop job', async () => {
+    await startSession(api, ctx);
+    await commandHandler(api, 'loop')('10s say hello', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/^started loop_/));
+    await shutdownSession(api);
+  });
+
+  it('schedule command starts a schedule job', async () => {
+    await startSession(api, ctx);
+    await commandHandler(api, 'schedule')('in 30s say hello', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringMatching(/^started sched_/));
+    await shutdownSession(api);
+  });
+
+  it('jobs command lists jobs', async () => {
+    await startSession(api, ctx);
+    await commandHandler(api, 'jobs')('', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalled();
+    await shutdownSession(api);
+  });
+
+  it('cancel command warns on empty args', async () => {
+    await startSession(api, ctx);
+    await commandHandler(api, 'cancel')('  ', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Usage'), 'warning');
+    await shutdownSession(api);
   });
 
   it('background command starts a job immediately', async () => {

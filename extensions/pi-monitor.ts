@@ -1,35 +1,33 @@
 /**
  * pi-monitor — background / monitor / loop / schedule jobs for pi.
  *
- * SCAFFOLD: command surface is registered, handlers are stubs. The implementation
- * plan, locked-in design decisions, and milestones live in ../PLAN.md (read it first);
- * API research with citations lives in ../docs/research/.
- *
- * Planned surface (PLAN.md §3.3):
- *   /background <command>
- *   /monitor --regex <pattern> [--before N] [--after N] [--debounce S] -- <command>
- *   /loop <interval> <prompt>
- *   /schedule in <duration> <prompt> | at <iso-date> <prompt>
- *   /jobs
- *   /cancel <jobID>
- * plus AI-callable tools jobs_background / jobs_monitor / jobs_loop / jobs_schedule /
- * jobs_list / jobs_cancel (TypeBox params), registered in M1 once handlers exist —
- * stubs are deliberately NOT registered as tools so a scaffold install does not
- * pollute the model's tool list with broken entries.
+ * M1 implementation: all six commands + six tools, delivery coalescing, lifecycle cleanup.
+ * PLAN.md §3.3 tool table and §3.2 delivery tree are the authoritative specs.
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { JobRegistry } from "../src/registry.ts";
 import { ProcessRunner } from "../src/runner/process-runner.ts";
 import { MonitorEngine } from "../src/runner/monitor-engine.ts";
 import { vetRegexPattern, close as closeRedos } from "../src/runner/redos.ts";
-import { parseBackground, parseMonitor } from "../src/parser/index.ts";
+import { PromptScheduler } from "../src/scheduler.ts";
+import type { DeliveryCallback, LoopConfig, ScheduleConfig, PromptSchedulerRequest } from "../src/scheduler.ts";
+import { parseBackground, parseMonitor, parseLoop, parseSchedule } from "../src/parser/index.ts";
 import { DeliveryService } from "../src/delivery.ts";
-import type { OutputEvent } from "../src/types.ts";
-import { MIN_MONITOR_DEBOUNCE_S, MAX_MONITOR_DEBOUNCE_S } from "../src/limits.ts";
+import type { OutputEvent, JobRecord } from "../src/types.ts";
+import { formatJobs, formatCancel } from "../src/delivery-format.ts";
+import {
+  MIN_LOOP_INTERVAL_MS,
+  MAX_SCHEDULE_HORIZON_MS,
+  MIN_MONITOR_DEBOUNCE_S,
+  MAX_MONITOR_DEBOUNCE_S,
+} from "../src/limits.ts";
+
+const MAX_MONITOR_CONTEXT_LINES = 200;
 
 /* ------------------------------------------------------------------ */
-/* Tool schemas (TypeBox — no @earendil-works/pi-ai import yet)       */
+/* Tool schemas (TypeBox + StringEnum from @earendil-works/pi-ai)      */
 /* ------------------------------------------------------------------ */
 
 const BackgroundToolSchema = Type.Object({
@@ -42,19 +40,53 @@ const MonitorToolSchema = Type.Object({
   before: Type.Optional(Type.Number()),
   after: Type.Optional(Type.Number()),
   debounceSeconds: Type.Optional(Type.Number()),
-  deliver: Type.Optional(Type.String({ description: 'polite (default) or steer' })),
+  deliver: Type.Optional(StringEnum(["polite", "steer"], {
+    description: "Delivery urgency (default: polite)",
+    default: "polite",
+  })),
 });
 
-const MAX_MONITOR_CONTEXT_LINES = 200;
+const LoopToolSchema = Type.Object({
+  intervalSeconds: Type.Number(),
+  prompt: Type.String(),
+});
+
+const ScheduleToolSchema = Type.Object({
+  at: Type.Optional(Type.String({ description: "ISO-8601 date/time (mutually exclusive with inSeconds)" })),
+  inSeconds: Type.Optional(Type.Number()),
+  prompt: Type.String(),
+});
+
+const CancelToolSchema = Type.Object({
+  jobID: Type.String(),
+});
+
+const ListToolSchema = Type.Object({});
 
 type BackgroundToolParams = Static<typeof BackgroundToolSchema>;
-type MonitorToolParams = Static<typeof MonitorToolSchema>;
+type MonitorToolParams = {
+  command: string;
+  regex: string;
+  before?: number;
+  after?: number;
+  debounceSeconds?: number;
+  deliver?: string;
+};
+type LoopToolParams = Static<typeof LoopToolSchema>;
+type ScheduleToolParams = Static<typeof ScheduleToolSchema>;
+type CancelToolParams = Static<typeof CancelToolSchema>;
+type ListToolParams = Static<typeof ListToolSchema>;
+
+/* ------------------------------------------------------------------ */
+/* Extension factory                                                 */
+/* ------------------------------------------------------------------ */
 
 export default function (pi: ExtensionAPI) {
   /* Session-local runtime state (factory closure) */
   let registry: JobRegistry | null = null;
   let runner: ProcessRunner | null = null;
   let engines: Map<string, MonitorEngine> | null = null;
+  let scheduler: PromptScheduler | null = null;
   let delivery: DeliveryService | null = null;
 
   pi.on("session_start", async (_event, ctx) => {
@@ -62,24 +94,55 @@ export default function (pi: ExtensionAPI) {
     runner = new ProcessRunner();
     engines = new Map();
     delivery = new DeliveryService();
+
+    const deliveryCb: DeliveryCallback = (req: PromptSchedulerRequest): void | Promise<void> => {
+      deliverPrompt(pi, ctx, req);
+      return undefined;
+    };
+    scheduler = new PromptScheduler({ delivery: deliveryCb });
     ctx.ui.setStatus("pi-monitor", "jobs idle");
   });
 
   pi.on("session_shutdown", async () => {
-    if (engines) {
-      for (const engine of engines.values()) engine.destroy();
+    // 1. Cancel all active scheduler jobs (loops + one-shot)
+    if (scheduler) {
+      scheduler.destroy();
+      scheduler = null;
     }
-    if (registry) {
+
+    // 2. Dispose all runner processes
+    if (registry && runner) {
       for (const job of registry.active()) {
-        runner?.dispose(job.jobID);
+        runner.dispose(job.jobID);
       }
     }
+
+    // 3. Destroy all monitor engines
+    if (engines) {
+      for (const engine of engines.values()) engine.destroy();
+      engines.clear();
+    }
+
+    // 4. Clear delivery coalescing
     delivery?.clear();
-    await closeRedos();
-    registry = null;
-    runner = null;
-    engines = null;
     delivery = null;
+
+    // 5. Close ReDoS workers
+    await closeRedos();
+
+    // 6. Drop stale refs
+    engines = null;
+    runner = null;
+    registry = null;
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    if (!registry || !delivery) return;
+    for (const job of registry.active()) {
+      if (job.kind === "loop") {
+        delivery.flushCoalescedLoop(pi, ctx, job.jobID);
+      }
+    }
   });
 
   /* ---------------------------------------------------------------- */
@@ -198,21 +261,199 @@ export default function (pi: ExtensionAPI) {
     return `started ${jobID}`;
   }
 
+  async function handleLoop(
+    ctx: ExtensionContext,
+    intervalMs: number,
+    prompt: string,
+  ): Promise<string> {
+    const r = registry!;
+    const sched = scheduler!;
+    const deliveryRef = delivery!;
+    const jobID = r.register("loop");
+
+    const cfg: LoopConfig = {
+      jobID,
+      sessionID: r.sessionID,
+      intervalMs,
+      prompt,
+    };
+
+    // Override the scheduler's delivery callback for this loop to include coalescing
+    sched.scheduleLoop(cfg);
+    return `started ${jobID}`;
+  }
+
+  async function handleSchedule(
+    ctx: ExtensionContext,
+    runAt: Date,
+    prompt: string,
+  ): Promise<string> {
+    const r = registry!;
+    const sched = scheduler!;
+    const jobID = r.register("sched");
+
+    const cfg: ScheduleConfig = {
+      jobID,
+      sessionID: r.sessionID,
+      runAt,
+      prompt,
+    };
+
+    sched.scheduleOnce(cfg);
+    return `started ${jobID}`;
+  }
+
+  function validatePrompt(source: string, prompt: string): string {
+    const trimmed = prompt.trim();
+    if (trimmed.length === 0) {
+      throw new Error(`${source}: prompt is empty`);
+    }
+    return trimmed;
+  }
+
+  function validateToolLoop(params: LoopToolParams): { intervalMs: number; prompt: string } {
+    if (!Number.isFinite(params.intervalSeconds) || !Number.isInteger(params.intervalSeconds)) {
+      throw new Error("jobs_loop: intervalSeconds must be an integer number of seconds");
+    }
+    const intervalMs = params.intervalSeconds * 1_000;
+    if (intervalMs < MIN_LOOP_INTERVAL_MS) {
+      throw new Error(`jobs_loop: intervalSeconds must be >= ${MIN_LOOP_INTERVAL_MS / 1_000}`);
+    }
+    return { intervalMs, prompt: validatePrompt("jobs_loop", params.prompt) };
+  }
+
+  function validateToolSchedule(params: ScheduleToolParams): { runAt: Date; prompt: string } {
+    const hasAt = params.at !== undefined;
+    const hasInSeconds = params.inSeconds !== undefined;
+    if (hasAt === hasInSeconds) {
+      throw new Error("jobs_schedule: provide exactly one of 'at' (ISO date) or 'inSeconds'");
+    }
+
+    const now = Date.now();
+    let runAt: Date;
+    if (hasAt) {
+      runAt = new Date(params.at!);
+      if (Number.isNaN(runAt.getTime())) {
+        throw new Error("jobs_schedule: 'at' must be a valid ISO-8601 date");
+      }
+      if (runAt.getTime() <= now) {
+        throw new Error("jobs_schedule: 'at' target must be in the future");
+      }
+    } else {
+      if (!Number.isFinite(params.inSeconds!) || !Number.isInteger(params.inSeconds!) || params.inSeconds! <= 0) {
+        throw new Error("jobs_schedule: 'inSeconds' must be a positive integer number of seconds");
+      }
+      runAt = new Date(now + params.inSeconds! * 1_000);
+    }
+
+    if (runAt.getTime() > now + MAX_SCHEDULE_HORIZON_MS) {
+      throw new Error("jobs_schedule: target exceeds 30-day horizon");
+    }
+    return { runAt, prompt: validatePrompt("jobs_schedule", params.prompt) };
+  }
+
+  function handleList(ctx: ExtensionContext): string {
+    const r = registry!;
+    const jobs: Array<{ jobID: string; kind: string; status: string }> = [];
+    for (const job of r.list()) {
+      jobs.push({
+        jobID: job.jobID,
+        kind: job.kind as import("../src/types.ts").JobKind,
+        status: job.state,
+      });
+    }
+    if (jobs.length === 0) {
+      return "no jobs";
+    }
+    const formatted = formatJobs(jobs as import("../src/delivery-format.ts").JobStatus[]);
+    return formatted.text;
+  }
+
+  async function handleCancel(ctx: ExtensionContext, jobID: string): Promise<string> {
+    const r = registry!;
+    const runnerRef = runner!;
+    const schedRef = scheduler;
+    const enginesRef = engines!;
+
+    const record = r.get(jobID);
+    if (!record) {
+      return `job ${jobID} not found`;
+    }
+    if (record.state !== "active") {
+      return `job ${jobID} cannot be cancelled (state: ${record.state})`;
+    }
+
+    // Cancel scheduler resource (loop or one-shot)
+    if (schedRef) {
+      schedRef.cancel(jobID);
+    }
+
+    // Destroy monitor engine
+    const engine = enginesRef.get(jobID);
+    if (engine) {
+      engine.destroy();
+      enginesRef.delete(jobID);
+    }
+
+    // Mark registry cancelled before awaiting process teardown so async process
+    // completion cannot race the registry into a false completed/failed state.
+    try {
+      r.cancel(jobID);
+    } catch (error) {
+      const latest = r.get(jobID);
+      if (latest && latest.state !== "active") {
+        return `job ${jobID} cannot be cancelled (state: ${latest.state})`;
+      }
+      throw error;
+    }
+
+    // Cancel runner process (SIGTERM → SIGKILL)
+    if (runnerRef) {
+      try {
+        await runnerRef.cancel(jobID);
+      } catch {
+        // Process may already be gone
+      }
+    }
+
+    return `${jobID} → cancelled`;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Prompt delivery from scheduler                                 */
+  /* ---------------------------------------------------------------- */
+
+  function deliverPrompt(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    req: PromptSchedulerRequest,
+  ): void {
+    const registryRef = registry;
+    if (!registryRef) return;
+    const deliveryRef = delivery!;
+    try {
+      deliveryRef.deliver(pi, ctx, {
+        jobID: req.jobID,
+        kind: req.kind === "loop" ? "loop" : "sched",
+        content: req.text,
+        urgency: "polite",
+        isProcessOutput: false,
+        isLoopTick: req.kind === "loop",
+      });
+      if (req.kind === "sched") {
+        registryRef.complete(req.jobID);
+      }
+    } catch (error) {
+      if (req.kind === "sched") {
+        registryRef.fail(req.jobID);
+      }
+      throw error;
+    }
+  }
+
   /* ---------------------------------------------------------------- */
   /* Slash command handlers                                            */
   /* ---------------------------------------------------------------- */
-
-  for (const name of ["loop", "schedule", "jobs", "cancel"]) {
-    pi.registerCommand(name, {
-      description: `${name} — pi-monitor (not implemented yet)`,
-      handler: async (_args, ctx) => {
-        ctx.ui.notify(
-          `pi-monitor: /${name} is scaffolded but not implemented yet — see PLAN.md milestone M1`,
-          "warning",
-        );
-      },
-    });
-  }
 
   pi.registerCommand("background", {
     description: "Run a shell command in the background; deliver the output tail on exit",
@@ -236,6 +477,45 @@ export default function (pi: ExtensionAPI) {
         parsed.after,
         parsed.debounceMs,
       );
+      ctx.ui.notify(result);
+    },
+  });
+
+  pi.registerCommand("loop", {
+    description: "Repeat a prompt on an interval; busy ticks coalesce (/loop 5m <prompt>)",
+    handler: async (args, ctx) => {
+      const { intervalMs, prompt } = parseLoop(args);
+      const result = await handleLoop(ctx, intervalMs, prompt);
+      ctx.ui.notify(result);
+    },
+  });
+
+  pi.registerCommand("schedule", {
+    description: "Submit a prompt once, later (/schedule in 10m <prompt> | at <iso> <prompt>)",
+    handler: async (args, ctx) => {
+      const { runAt, prompt } = parseSchedule(args);
+      const result = await handleSchedule(ctx, runAt, prompt);
+      ctx.ui.notify(result);
+    },
+  });
+
+  pi.registerCommand("jobs", {
+    description: "List active and recent background jobs",
+    handler: async (_args, ctx) => {
+      const result = handleList(ctx);
+      ctx.ui.notify(result);
+    },
+  });
+
+  pi.registerCommand("cancel", {
+    description: "Cancel a job by ID (/cancel <jobID>)",
+    handler: async (args, ctx) => {
+      const jobID = args.trim();
+      if (!jobID) {
+        ctx.ui.notify("Usage: /cancel <jobID>", "warning");
+        return;
+      }
+      const result = await handleCancel(ctx, jobID);
       ctx.ui.notify(result);
     },
   });
@@ -295,6 +575,78 @@ export default function (pi: ExtensionAPI) {
       const debounceMs = debounceSeconds * 1_000;
       const urgency = params.deliver === "steer" ? "interrupt" : "polite";
       const result = await handleMonitor(ctx, params.command, regex, before, after, debounceMs, urgency);
+      return { content: [{ type: "text", text: result }] as const, details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "jobs_loop",
+    label: "jobs_loop",
+    description:
+      "Repeatedly submit a prompt at a given interval. Returns immediately with the job ID; ticks coalesce while the session is busy.",
+    parameters: LoopToolSchema,
+    execute: async (
+      _toolCallId: string,
+      params: LoopToolParams,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      ctx: ExtensionContext,
+    ) => {
+      const { intervalMs, prompt } = validateToolLoop(params);
+      const result = await handleLoop(ctx, intervalMs, prompt);
+      return { content: [{ type: "text", text: result }] as const, details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "jobs_schedule",
+    label: "jobs_schedule",
+    description:
+      "Submit a prompt once at a future time. Returns immediately with the job ID.",
+    parameters: ScheduleToolSchema,
+    execute: async (
+      _toolCallId: string,
+      params: ScheduleToolParams,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      ctx: ExtensionContext,
+    ) => {
+      const { runAt, prompt } = validateToolSchedule(params);
+      const result = await handleSchedule(ctx, runAt, prompt);
+      return { content: [{ type: "text", text: result }] as const, details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "jobs_list",
+    label: "jobs_list",
+    description: "List active and recently completed background jobs.",
+    parameters: ListToolSchema,
+    execute: async (
+      _toolCallId: string,
+      _params: ListToolParams,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      ctx: ExtensionContext,
+    ) => {
+      const result = handleList(ctx);
+      return { content: [{ type: "text", text: result }] as const, details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "jobs_cancel",
+    label: "jobs_cancel",
+    description: "Cancel a background job by ID.",
+    parameters: CancelToolSchema,
+    execute: async (
+      _toolCallId: string,
+      params: CancelToolParams,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      ctx: ExtensionContext,
+    ) => {
+      const result = await handleCancel(ctx, params.jobID);
       return { content: [{ type: "text", text: result }] as const, details: undefined };
     },
   });
