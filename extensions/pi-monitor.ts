@@ -22,6 +22,7 @@ import {
   MAX_SCHEDULE_HORIZON_MS,
   MIN_MONITOR_DEBOUNCE_S,
   MAX_MONITOR_DEBOUNCE_S,
+  MAX_REGEX_PATTERN_LENGTH,
 } from "../src/limits.ts";
 
 const MAX_MONITOR_CONTEXT_LINES = 200;
@@ -37,6 +38,7 @@ const BackgroundToolSchema = Type.Object({
 const MonitorToolSchema = Type.Object({
   command: Type.String(),
   regex: Type.String(),
+  regexFlags: Type.Optional(Type.String({ description: "RegExp flags (default: '')" })),
   before: Type.Optional(Type.Number()),
   after: Type.Optional(Type.Number()),
   debounceSeconds: Type.Optional(Type.Number()),
@@ -548,7 +550,19 @@ export default function (pi: ExtensionAPI) {
       _onUpdate: any,
       ctx: ExtensionContext,
     ) => {
-      const regex = new RegExp(params.regex);
+      // Validate regex pattern length (parity with parseMonitor)
+      if (params.regex.length > MAX_REGEX_PATTERN_LENGTH) {
+        throw new Error(`jobs_monitor: regex pattern exceeds ${MAX_REGEX_PATTERN_LENGTH} characters`);
+      }
+
+      // Validate regex flags (parity with parseMonitor checkFlags)
+      const flags = params.regexFlags ?? '';
+      for (const ch of flags) {
+        if (ch === 'g') throw new Error("jobs_monitor: unsupported regex flag 'g'");
+        if (ch === 'y') throw new Error("jobs_monitor: unsupported regex flag 'y'");
+      }
+
+      const regex = new RegExp(params.regex, flags);
       const before = params.before ?? 10;
       const after = params.after ?? 10;
       if (!Number.isInteger(before) || before < 0 || before > MAX_MONITOR_CONTEXT_LINES) {

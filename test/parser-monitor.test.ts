@@ -57,6 +57,12 @@ describe('parseMonitor', () => {
     expect(() => parseMonitor(`--regex ${long} -- echo x`)).toThrow('512');
   });
 
+  it('rejects pattern exactly at limit', () => {
+    const exact = 'x'.repeat(512);
+    const result = parseMonitor(`--regex ${exact} -- echo x`);
+    expect(result.regex.source).toBe(exact);
+  });
+
   it('enforces -- separator before command', () => {
     const r = parseMonitor('--regex /x/i --debounce 1 -- echo hello');
     expect(r.command).toBe('echo hello');

@@ -293,3 +293,146 @@ describe('command handlers', () => {
     await shutdownSession(api);
   });
 });
+
+describe('jobs_monitor validation parity with /monitor', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  it('rejects regex pattern exceeding MAX_REGEX_PATTERN_LENGTH before starting a job', async () => {
+    await startSession(api, ctx);
+
+    const longPattern = 'x'.repeat(513);
+
+    await expect(
+      tool(api, 'jobs_monitor').execute(
+        'call-long',
+        {
+          command: 'printf SHOULD_NOT_RUN',
+          regex: longPattern,
+          debounceSeconds: 1,
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ).rejects.toThrow('512');
+
+    // No job was started — no sendMessage or ui.notify for a monitor job
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/^started mon_/));
+    expect(api.sendMessage).not.toHaveBeenCalled();
+
+    await shutdownSession(api);
+  });
+
+  it('rejects unsupported regex flag g before starting a job', async () => {
+    await startSession(api, ctx);
+
+    await expect(
+      tool(api, 'jobs_monitor').execute(
+        'call-flags-g',
+        {
+          command: 'printf SHOULD_NOT_RUN',
+          regex: 'x',
+          regexFlags: 'g',
+          debounceSeconds: 1,
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ).rejects.toThrow("unsupported regex flag 'g'");
+
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/^started mon_/));
+    expect(api.sendMessage).not.toHaveBeenCalled();
+
+    await shutdownSession(api);
+  });
+
+  it('rejects unsupported regex flag y before starting a job', async () => {
+    await startSession(api, ctx);
+
+    await expect(
+      tool(api, 'jobs_monitor').execute(
+        'call-flags-y',
+        {
+          command: 'printf SHOULD_NOT_RUN',
+          regex: 'x',
+          regexFlags: 'y',
+          debounceSeconds: 1,
+        },
+        undefined,
+        undefined,
+        ctx,
+      ),
+    ).rejects.toThrow("unsupported regex flag 'y'");
+
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringMatching(/^started mon_/));
+    expect(api.sendMessage).not.toHaveBeenCalled();
+
+    await shutdownSession(api);
+  });
+
+  it('accepts supported flags i/m/u and starts job', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-flags-imu',
+      {
+        command: 'printf MATCH',
+        regex: 'MATCH',
+        regexFlags: 'im',
+        debounceSeconds: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.content[0].text).toMatch(/^started mon_/);
+    await shutdownSession(api);
+  });
+
+  it('preserves defaults for before, after, debounceSeconds, and deliver', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-defaults',
+      {
+        command: 'printf DEFAULTS',
+        regex: 'DEFAULTS',
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.content[0].text).toMatch(/^started mon_/);
+    await shutdownSession(api);
+  });
+
+  it('preserves deliver steer urgency', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-steer',
+      {
+        command: 'printf STEER',
+        regex: 'STEER',
+        deliver: 'steer',
+        debounceSeconds: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.content[0].text).toMatch(/^started mon_/);
+    await shutdownSession(api);
+  });
+});
