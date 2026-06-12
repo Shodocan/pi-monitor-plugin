@@ -1,0 +1,221 @@
+import { describe, expect, it } from 'vitest';
+import {
+  formatCancel,
+  formatDelivery,
+  formatJobs,
+  generateNonce,
+  redactSecrets,
+  sanitize,
+  JobStatus,
+} from '../src/delivery-format.ts';
+
+describe('generateNonce', () => {
+  it('returns a 32-char hex string', () => {
+    expect(generateNonce()).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('produces unique nonces', () => {
+    const a = generateNonce();
+    const b = generateNonce();
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('sanitize', () => {
+  it('strips CSI escape sequences', () => {
+    expect(sanitize('\x1b[31mred\x1b[0m')).toBe('red');
+  });
+
+  it('strips OSC sequences', () => {
+    expect(sanitize('\x1b]0;title\x07text')).toBe('text');
+  });
+
+  it('preserves newlines and tabs', () => {
+    const input = 'line1\n\tindented\tand more\t\r';
+    expect(sanitize(input)).toBe('line1\n\tindented\tand more\t');
+  });
+
+  it('removes stray control chars', () => {
+    expect(sanitize('a\x00b\x07c')).toBe('abc');
+  });
+
+  it('handles plain text unchanged', () => {
+    expect(sanitize('no escapes here')).toBe('no escapes here');
+  });
+});
+
+describe('redactSecrets', () => {
+  it('redacts TOKEN value with = separator', () => {
+    expect(redactSecrets('TOKEN=eyJabc123')).toBe('TOKEN=****');
+  });
+
+  it('redacts TOKEN value with : separator', () => {
+    expect(redactSecrets('TOKEN: my-secret-val')).toBe('TOKEN: ****');
+  });
+
+  it('preserves original separator style (= vs :)', () => {
+    expect(redactSecrets('API_KEY=abcde12345')).toBe('API_KEY=****');
+    expect(redactSecrets('API_KEY: my-secure-key')).toBe('API_KEY: ****');
+  });
+
+  it('redacts ACCESS_TOKEN value', () => {
+    expect(redactSecrets('ACCESS_TOKEN=secret-value')).toBe('ACCESS_TOKEN=****');
+  });
+
+  it('redacts BEARER_TOKEN value', () => {
+    expect(redactSecrets('BEARER_TOKEN=xyz')).toBe('BEARER_TOKEN=****');
+  });
+
+  it('redacts PRIVATE_KEY value', () => {
+    expect(redactSecrets('PRIVATE_KEY=key123')).toBe('PRIVATE_KEY=****');
+  });
+
+  it('redacts API_KEY value', () => {
+    expect(redactSecrets('API_KEY=abcdef')).toBe('API_KEY=****');
+  });
+
+  it('redacts SECRET value in nested = patterns', () => {
+    expect(redactSecrets('SECRET=myvalue')).toContain('****');
+  });
+
+  it('redacts PASSWORD value even with special chars', () => {
+    expect(redactSecrets('PASSWORD=myP@ss!')).toContain('****');
+  });
+
+  it('redacts Authorization Bearer header', () => {
+    expect(redactSecrets('Authorization Bearer token123abc')).toBe('Authorization Bearer ****');
+  });
+
+  it('redacts dotted Authorization Bearer values such as JWTs', () => {
+    expect(redactSecrets('Authorization Bearer header.payload.signature')).toBe(
+      'Authorization Bearer ****'
+    );
+  });
+
+  it('redacts URL userinfo', () => {
+    expect(redactSecrets('http://user:pass@host/path')).toBe('http://****@host/path');
+  });
+
+  it('is case insensitive for secret keys', () => {
+    expect(redactSecrets('api_key=key123')).toBe('api_key=****');
+  });
+
+  it('redacts double-quoted key/value pairs', () => {
+    expect(redactSecrets('"TOKEN"="secretVal"')).toBe('"TOKEN"="****"');
+  });
+
+  it('redacts single-quoted key/value pairs', () => {
+    expect(redactSecrets("'SECRET'='topsecret'")).toBe("'SECRET'='****'");
+  });
+
+  it('redacts mixed-quote and bare-key patterns', () => {
+    const out = redactSecrets('TOKEN="secret" PASSWORD:plain');
+    expect(out).toBe('TOKEN="****" PASSWORD:****');
+  });
+
+  it('leaves unknown text unchanged', () => {
+    expect(redactSecrets('hello world')).toBe('hello world');
+  });
+});
+
+describe('formatDelivery', () => {
+  it('wraps content with nonce fences', () => {
+    const result = formatDelivery('hello\nworld');
+    const lines = result.text.split('\n');
+    expect(lines.length).toBeGreaterThanOrEqual(4);
+    expect(lines[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(lines[lines.length - 1]).toMatch(/^[0-9a-f]{32}$/);
+    expect(lines[1]).toBe('monitor triggered.');
+  });
+
+  it('sanitizes raw input', () => {
+    const result = formatDelivery('\x1b[31mred\x1b[0m');
+    expect(result.text).not.toContain('\x1b');
+  });
+
+  it('redacts secrets in output', () => {
+    const result = formatDelivery('TOKEN=secret123');
+    expect(result.text).toContain('****');
+    expect(result.text).not.toContain('secret123');
+  });
+
+  it('allows an injectable nonce', () => {
+    const result = formatDelivery('test', { nonce: 'abcdef0123456789abcdef0123456789' });
+    expect(result.text).toMatch(/^abcdef0123456789abcdef0123456789$/m);
+  });
+
+  it('produces commandPreview and promptPreview', () => {
+    const long = 'a'.repeat(300);
+    const result = formatDelivery(long);
+    expect(result.commandPreview?.length).toBeLessThanOrEqual(200);
+    expect(result.promptPreview?.length).toBeLessThanOrEqual(200);
+  });
+
+  it('truncates previews at maxPreviewLen', () => {
+    const long = 'x'.repeat(500);
+    const result = formatDelivery(long, { maxPreviewLen: 50 });
+    expect(result.commandPreview?.length).toBeLessThanOrEqual(51);
+  });
+
+  it('avoids nested fences when input is already nonce-fenced', () => {
+    const nonce = 'a'.repeat(32);
+    const fenced = [nonce, 'monitor triggered.', 'inner content', nonce].join('\n');
+    const result = formatDelivery(fenced, { nonce: 'b'.repeat(32) });
+    const lines = result.text.split('\n');
+
+    // Outer fence is the new nonce
+    expect(lines[0]).toBe('b'.repeat(32));
+    expect(lines[lines.length - 1]).toBe('b'.repeat(32));
+
+    // Inner content preserved
+    expect(result.text).toContain('inner content');
+
+    // Old nonce does not appear (no nested fence)
+    const oldNonceCount = lines.filter((l) => l === nonce).length;
+    expect(oldNonceCount).toBe(0);
+  });
+});
+
+describe('formatJobs', () => {
+  it('lists all jobs with kind and status', () => {
+    const jobs: JobStatus[] = [
+      { jobID: 'j1', kind: 'bg', status: 'active' },
+      { jobID: 'j2', kind: 'mon', status: 'failed' },
+    ];
+    const result = formatJobs(jobs);
+    expect(result.text).toContain('j1 (background) → active');
+    expect(result.text).toContain('j2 (monitor) → failed');
+  });
+
+  it('includes directive and nonce fences', () => {
+    const jobs: JobStatus[] = [{ jobID: 'x', kind: 'loop', status: 'completed' }];
+    const result = formatJobs(jobs);
+    const lines = result.text.split('\n');
+    expect(lines[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(lines[1]).toBe('monitor triggered.');
+  });
+});
+
+describe('formatCancel', () => {
+  it('emits a cancelled message', () => {
+    const result = formatCancel('job-42', 'mon');
+    expect(result.text).toContain('job-42 (monitor) → cancelled');
+  });
+
+  it('wraps with nonce fences', () => {
+    const result = formatCancel('j1', 'bg');
+    const lines = result.text.split('\n');
+    expect(lines[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(lines[lines.length - 1]).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('includes directive', () => {
+    const result = formatCancel('j', 'sched');
+    expect(result.text).toContain('monitor triggered.');
+  });
+
+  it('accepts opts with injectable nonce', () => {
+    const result = formatCancel('j1', 'bg', { nonce: 'deadbeefdeadbeefdeadbeefdeadbeef' });
+    expect(result.text).toMatch(/^deadbeefdeadbeefdeadbeefdeadbeef$/m);
+  });
+});
