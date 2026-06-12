@@ -87,10 +87,16 @@ class WorkerPool {
     timeoutMs: number,
   ): Promise<WorkerResult> {
     this.#pending += 1;
-    const worker = new Worker(THREAD_CODE, {
-      eval: true,
-      workerData: { pattern, flags, text },
-    });
+    let worker: Worker;
+    try {
+      worker = new Worker(THREAD_CODE, {
+        eval: true,
+        workerData: { pattern, flags, text },
+      });
+    } catch (err) {
+      this.#freeSlot();
+      return Promise.reject(err);
+    }
     this.#pool.add(worker);
 
     return new Promise<WorkerResult>((resolve, reject) => {
@@ -131,6 +137,12 @@ class WorkerPool {
 
       worker.once('exit', () => {
         this.#pool.delete(worker);
+        // If the worker exited before posting a message or error
+        // (crash, OOM, SIGKILL, or pre-online termination), settle
+        // the promise so it rejects instead of hanging and free the slot.
+        if (!settled) {
+          settle(false, new Error('worker exited prematurely'));
+        }
       });
     });
   }
