@@ -179,6 +179,8 @@ export default function (pi: ExtensionAPI) {
         }
       } catch {
         r.fail(jobID);
+      } finally {
+        runnerRef.dispose(jobID);
       }
     })().catch(() => {});
 
@@ -250,6 +252,7 @@ export default function (pi: ExtensionAPI) {
         if (onOutput) runnerRef.removeListener("output", onOutput);
         engine.destroy();
         enginesRef.delete(jobID);
+        runnerRef.dispose(jobID);
       }
     })().catch(() => {});
 

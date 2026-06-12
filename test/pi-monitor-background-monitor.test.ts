@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import extension from '../extensions/pi-monitor.ts';
 
@@ -147,6 +147,10 @@ describe('session lifecycle', () => {
     extension(api);
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('session_start initializes runtime state and sets status', async () => {
     const startHandler = (api.on as ReturnType<typeof vi.fn>).mock.calls.find(
       (c: any[]) => c[0] === 'session_start',
@@ -289,6 +293,154 @@ describe('command handlers', () => {
       ),
     ).rejects.toThrow('before');
     expect(api.sendMessage).not.toHaveBeenCalled();
+
+    await shutdownSession(api);
+  });
+});
+
+describe('completed jobs release runner state', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  it('natural background completion disposes runner handle and tail', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+    const disposeSpy = vi.spyOn(ProcessRunner.prototype, 'dispose');
+
+    const result = await tool(api, 'jobs_background').execute(
+      'call-bg-dispose',
+      { command: 'printf bg-dispose' },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    await vi.waitFor(() => expect(disposeSpy).toHaveBeenCalledWith(jobID));
+
+    await shutdownSession(api);
+  });
+
+  it('cancellation disposes runner handle and tail for background jobs', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+    const disposeSpy = vi.spyOn(ProcessRunner.prototype, 'dispose');
+
+    const result = await tool(api, 'jobs_background').execute(
+      'call-bg-cancel',
+      { command: 'sleep 60' },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    // Cancel the job
+    await tool(api, 'jobs_cancel').execute(
+      'call-cancel',
+      { jobID },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    await vi.waitFor(() => expect(disposeSpy).toHaveBeenCalledWith(jobID));
+
+    await shutdownSession(api);
+  });
+
+  it('cancellation disposes runner handle and tail for monitor jobs', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+    const disposeSpy = vi.spyOn(ProcessRunner.prototype, 'dispose');
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-cancel',
+      {
+        command: 'sleep 60',
+        regex: 'NEVER_MATCHES',
+        debounceSeconds: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    await tool(api, 'jobs_cancel').execute(
+      'call-mon-cancel',
+      { jobID },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    await vi.waitFor(() => expect(disposeSpy).toHaveBeenCalledWith(jobID));
+
+    await shutdownSession(api);
+  });
+
+  it('session_shutdown disposes all runner handles', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+    const disposeSpy = vi.spyOn(ProcessRunner.prototype, 'dispose');
+
+    // Start two background jobs
+    await tool(api, 'jobs_background').execute(
+      'call-shutdown-1',
+      { command: 'sleep 60' },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await tool(api, 'jobs_background').execute(
+      'call-shutdown-2',
+      { command: 'sleep 60' },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    await shutdownSession(api);
+
+    // Both handles should be disposed by session_shutdown
+    expect(disposeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('natural monitor completion disposes runner handle and tail', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+    const disposeSpy = vi.spyOn(ProcessRunner.prototype, 'dispose');
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-dispose',
+      {
+        command: 'printf MON_DISPOSE',
+        regex: 'MON_DISPOSE',
+        debounceSeconds: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    await vi.waitFor(() => expect(disposeSpy).toHaveBeenCalledWith(jobID));
 
     await shutdownSession(api);
   });
