@@ -14,9 +14,8 @@ import {
   MAX_MONITOR_DEBOUNCE_S,
   MIN_LOOP_INTERVAL_MS,
   MAX_SCHEDULE_HORIZON_MS,
-  MAX_PENDING_PER_JOB,
-  MAX_PENDING_GLOBAL,
-  MAX_QUEUE_BYTES_TOTAL,
+  // MAX_PENDING_PER_JOB, MAX_PENDING_GLOBAL, MAX_QUEUE_BYTES_TOTAL — excluded:
+  // OpenCode bridge FIFO queue caps; not enforced by Pi-native delivery (see src/limits.ts).
   REDOS_TIMEOUT_MS,
   REDOS_MAX_CONCURRENT,
   CANCEL_SIGKILL_TIMEOUT_MS,
@@ -47,9 +46,8 @@ describe('limits — PLAN.md §7 values', () => {
     expect(MAX_MONITOR_DEBOUNCE_S).toBe(60);
     expect(MIN_LOOP_INTERVAL_MS).toBe(10_000);
     expect(MAX_SCHEDULE_HORIZON_MS).toBe(30 * 24 * 60 * 60 * 1000);
-    expect(MAX_PENDING_PER_JOB).toBe(20);
-    expect(MAX_PENDING_GLOBAL).toBe(100);
-    expect(MAX_QUEUE_BYTES_TOTAL).toBe(1024 * 1024);
+    // MAX_PENDING_PER_JOB, MAX_PENDING_GLOBAL, MAX_QUEUE_BYTES_TOTAL excluded:
+    // OpenCode bridge FIFO queue caps; Pi-native delivery coalesces to one bucket per job.
     expect(REDOS_TIMEOUT_MS).toBe(100);
     expect(REDOS_MAX_CONCURRENT).toBe(4);
     expect(CANCEL_SIGKILL_TIMEOUT_MS).toBe(5_000);

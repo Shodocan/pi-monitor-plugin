@@ -28,10 +28,10 @@ export const MIN_LOOP_INTERVAL_MS = 10_000;
 // Schedule limits
 export const MAX_SCHEDULE_HORIZON_MS = 30 * 24 * 60 * 60 * 1000;
 
-// Delivery queue limits
-export const MAX_PENDING_PER_JOB = 20;
-export const MAX_PENDING_GLOBAL = 100;
-export const MAX_QUEUE_BYTES_TOTAL = 1024 * 1024;
+// Delivery queue limits — excluded.
+// OpenCode bridge FIFO queue caps (MAX_PENDING_PER_JOB, MAX_PENDING_GLOBAL, MAX_QUEUE_BYTES_TOTAL)
+// are not ported: busy non-loop delivery is delegated to Pi nextTurn/steer, and loop delivery
+// coalesces to one bucket per job (src/delivery.ts).
 
 // ReDoS worker limits
 export const REDOS_TIMEOUT_MS = 100;
