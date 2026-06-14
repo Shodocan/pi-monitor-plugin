@@ -4,7 +4,7 @@
   "description": "Background, monitor, loop, and schedule jobs for the pi coding agent, with idle-aware session notifications. Ships a skill that watches GitHub for PRs awaiting your review and notifies your session.",
   "type": "module",
   "license": "MIT",
-  "author": "Walisson Casonatto <wdcasonatto@gmail.com>",
+  "author": "Walisson Casonatto",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Shodocan/pi-monitor-plugin.git"
