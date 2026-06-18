@@ -27,6 +27,7 @@ function makeMockContext(isIdle = true): ExtensionContext {
     hasUI: true,
     ui: {
       setStatus: vi.fn(),
+      setWidget: vi.fn(),
       notify: vi.fn(),
       select: vi.fn(),
       confirm: vi.fn(),
@@ -602,6 +603,69 @@ describe('schedule one-shot completion', () => {
       ctx,
     );
     expect(cancelResult.content[0].text).toContain('cannot be cancelled');
+    await shutdownSession(api);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Tests: TUI status/widget updates (Task 3)                           */
+/* ------------------------------------------------------------------ */
+
+describe('TUI status and widget updates', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  it('updates TUI status and widget when a loop job starts and is cancelled', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_loop').execute(
+      'call-loop-ui',
+      { intervalSeconds: 30, prompt: 'check review queue' },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = result.content[0].text.replace('started ', '');
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs loop:1');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith(
+      'pi-monitor',
+      expect.arrayContaining(['pi-monitor jobs', expect.stringContaining(jobID)]),
+    );
+
+    await tool(api, 'jobs_cancel').execute('cancel-loop-ui', { jobID }, undefined, undefined, ctx);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs idle');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith('pi-monitor', undefined);
+    await shutdownSession(api);
+  });
+
+  it('updates TUI status and widget when a scheduled job starts and is cancelled', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_schedule').execute(
+      'call-sched-ui',
+      { inSeconds: 30, prompt: 'check later' },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = result.content[0].text.replace('started ', '');
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs sched:1');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith(
+      'pi-monitor',
+      expect.arrayContaining(['pi-monitor jobs', expect.stringContaining(jobID)]),
+    );
+
+    await tool(api, 'jobs_cancel').execute('cancel-sched-ui', { jobID }, undefined, undefined, ctx);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs idle');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith('pi-monitor', undefined);
     await shutdownSession(api);
   });
 });
