@@ -1,6 +1,6 @@
 {
   "name": "pi-monitor-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Background, monitor, loop, and schedule jobs for the pi coding agent, with idle-aware session notifications. Ships a skill that watches GitHub for PRs awaiting your review and notifies your session.",
   "type": "module",
   "license": "MIT",
@@ -22,8 +22,12 @@
     "github"
   ],
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "files": [
     "extensions",
