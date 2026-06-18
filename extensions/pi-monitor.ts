@@ -24,6 +24,7 @@ import {
   MIN_MONITOR_DEBOUNCE_S,
   MAX_MONITOR_DEBOUNCE_S,
   MAX_REGEX_PATTERN_LENGTH,
+  MONITOR_PER_DELIVERY_CAP_BYTES,
 } from "../src/limits.ts";
 
 const MAX_MONITOR_CONTEXT_LINES = 200;
@@ -105,6 +106,58 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Session may already be tearing down; UI cleanup is best-effort.
     }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Monitor exit helpers                                               */
+  /* ---------------------------------------------------------------- */
+
+  const MONITOR_EXIT_HEADROOM_BYTES = 1024;
+
+  function isCleanExit(exit: ProcessExit): boolean {
+    return exit.code === 0 && exit.signal === null;
+  }
+
+  function exitReason(exit: ProcessExit): string {
+    if (exit.signal) return `signal ${exit.signal}`;
+    return `exit code ${exit.code ?? 'unknown'}`;
+  }
+
+  function capRecentOutput(tail: string): string {
+    const maxBytes = Math.max(0, MONITOR_PER_DELIVERY_CAP_BYTES - MONITOR_EXIT_HEADROOM_BYTES);
+    const bytes = Buffer.from(tail, 'utf8');
+    if (bytes.length <= maxBytes) return tail;
+    return `[truncated recent output to ${maxBytes} bytes]\n${bytes.subarray(bytes.length - maxBytes).toString('utf8')}`;
+  }
+
+  function monitorExitContent(jobID: string, exit: ProcessExit, tail: string): string {
+    const headline = isCleanExit(exit)
+      ? `${jobID} monitor stopped (${exitReason(exit)}); no longer watching.`
+      : `${jobID} monitor died (${exitReason(exit)}); no longer watching.`;
+    const cappedTail = capRecentOutput(tail);
+    return cappedTail.length > 0 ? `${headline}\n\nRecent output:\n${cappedTail}` : headline;
+  }
+
+  function notifyMonitorExit(
+    ctx: ExtensionContext,
+    deliveryRef: DeliveryService,
+    jobID: string,
+    exit: ProcessExit,
+    tail: string,
+  ): void {
+    if (isShuttingDown) return;
+    const clean = isCleanExit(exit);
+    const label = clean ? `${jobID} monitor stopped` : `${jobID} monitor died`;
+    if (ctx.hasUI) ctx.ui.notify(label, clean ? 'warning' : 'error');
+
+    deliveryRef.deliver(pi, ctx, {
+      jobID,
+      kind: 'mon',
+      content: monitorExitContent(jobID, exit, tail),
+      urgency: clean ? 'polite' : 'interrupt',
+      isProcessOutput: true,
+      isLoopTick: false,
+    });
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -300,11 +353,27 @@ export default function (pi: ExtensionAPI) {
 
     (async () => {
       try {
-        await exitPromise;
+        const exit = await exitPromise;
+
         if (isShuttingDown) return;
+
+        const latest = r.get(jobID);
+        const wasStillActive = latest?.state === "active";
+        if (!wasStillActive) return;
+
         engine.flush();
         if (isShuttingDown) return;
-        r.complete(jobID);
+
+        const tail = runnerRef.tail(jobID, "stdout")
+          .concat(runnerRef.tail(jobID, "stderr"))
+          .join("\n");
+
+        notifyMonitorExit(ctx, deliveryRef, jobID, exit, tail);
+        if (isCleanExit(exit)) {
+          r.complete(jobID);
+        } else {
+          r.fail(jobID);
+        }
         updateJobUi(ctx);
       } catch {
         if (!isShuttingDown) {
@@ -312,17 +381,10 @@ export default function (pi: ExtensionAPI) {
           updateJobUi(ctx);
         }
       } finally {
-        // removeListener is always safe and avoids a leaked emitter binding;
-        // the remaining cleanup side effects are already performed by
-        // session_shutdown (which destroys engines, clears the map, and
-        // disposes runner handles), so guard them to avoid double cleanup
-        // and stale teardown against a dying session.
         if (onOutput) runnerRef.removeListener("output", onOutput);
-        if (!isShuttingDown) {
-          engine.destroy();
-          enginesRef.delete(jobID);
-          runnerRef.dispose(jobID);
-        }
+        engine.destroy();
+        enginesRef.delete(jobID);
+        runnerRef.dispose(jobID);
       }
     })().catch(() => {});
 
