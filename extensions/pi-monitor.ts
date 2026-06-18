@@ -15,7 +15,7 @@ import { PromptScheduler } from "../src/scheduler.ts";
 import type { DeliveryCallback, LoopConfig, ScheduleConfig, PromptSchedulerRequest } from "../src/scheduler.ts";
 import { parseBackground, parseMonitor, parseLoop, parseSchedule } from "../src/parser/index.ts";
 import { DeliveryService } from "../src/delivery.ts";
-import type { OutputEvent, JobRecord } from "../src/types.ts";
+import type { OutputEvent, JobRecord, ProcessExit } from "../src/types.ts";
 import { formatJobs, formatCancel } from "../src/delivery-format.ts";
 import {
   MIN_LOOP_INTERVAL_MS,
@@ -152,7 +152,7 @@ export default function (pi: ExtensionAPI) {
     const runnerRef = runner!;
     const deliveryRef = delivery!;
     const jobID = r.register("bg");
-    let exitPromise: Promise<number | null>;
+    let exitPromise: Promise<ProcessExit>;
     try {
       ({ exitPromise } = runnerRef.run(jobID, command));
     } catch (error) {
@@ -205,7 +205,7 @@ export default function (pi: ExtensionAPI) {
     const jobID = r.register("mon");
     let engine: MonitorEngine | null = null;
     let onOutput: ((event: OutputEvent) => void) | null = null;
-    let exitPromise: Promise<number | null>;
+    let exitPromise: Promise<ProcessExit>;
     try {
       engine = new MonitorEngine({
         jobID,
