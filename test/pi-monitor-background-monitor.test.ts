@@ -712,3 +712,101 @@ describe('background shutdown stale-delivery guard', () => {
     expect(api.sendUserMessage).not.toHaveBeenCalled();
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Tests: monitor shutdown stale-delivery guard (Task 3 quality fix)  */
+/* ------------------------------------------------------------------ */
+
+describe('monitor shutdown stale-delivery guard', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not deliver monitor pending output after session_shutdown begins', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+
+    // Controllable exit: keep the process "alive" so the finalizer runs only
+    // once we resolve, strictly after shutdown has started.
+    let resolveExit!: (exit: ProcessExit) => void;
+    const stalledExit = new Promise<ProcessExit>((resolve) => {
+      resolveExit = resolve;
+    });
+    // Capture the runner instance so we can emit a matching output event
+    // that arms a debounce timer inside the engine.
+    let runnerInstance: typeof ProcessRunner.prototype | undefined;
+    vi.spyOn(ProcessRunner.prototype, 'run').mockImplementation(function (
+      this: typeof ProcessRunner.prototype,
+      jobID: string,
+    ) {
+      runnerInstance = this;
+      return { jobID, exitPromise: stalledExit };
+    });
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-stale',
+      {
+        command: 'printf MONITOR_STALE_MATCH',
+        regex: 'MONITOR_STALE_MATCH',
+        before: 0,
+        after: 0,
+        debounceSeconds: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content[0].text).toMatch(/^started mon_/);
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    // Emit a matching line so the engine queues a ready window and arms the
+    // debounce timer (1s). The onWindow callback would deliver this once the
+    // debounce fires — but we trigger shutdown before that happens.
+    runnerInstance!.emit('output', {
+      jobID,
+      seq: 1,
+      stream: 'stdout',
+      line: 'MONITOR_STALE_MATCH',
+      timestamp: Date.now(),
+    });
+
+    // session_shutdown begins: isShuttingDown flips true, the engine is
+    // destroyed (clearing its debounce timer), delivery is torn down.
+    await shutdownSession(api);
+
+    // Wait past the debounce window to prove the armed timer did not fire.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+    // The process now exits AFTER shutdown started — the finalizer resumes
+    // here and must bail before engine.flush() and skip double cleanup.
+    resolveExit({ code: 0, signal: null });
+    // Drain the finalizer microtask.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Stale monitor output must NOT reach the session after shutdown.
+    // Assert no sendMessage / sendUserMessage payload includes the match text
+    // or any monitor stopped/died notification.
+    const sendCalls = (api.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
+    for (const call of sendCalls) {
+      const payload = JSON.stringify(call);
+      expect(payload).not.toContain('MONITOR_STALE_MATCH');
+      expect(payload).not.toMatch(/monitor (stopped|died)/i);
+    }
+    const userCalls = (api.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls;
+    for (const call of userCalls) {
+      const payload = JSON.stringify(call);
+      expect(payload).not.toContain('MONITOR_STALE_MATCH');
+      expect(payload).not.toMatch(/monitor (stopped|died)/i);
+    }
+  }, 10_000);
+});

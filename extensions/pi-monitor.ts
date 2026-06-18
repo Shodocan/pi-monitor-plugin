@@ -312,10 +312,17 @@ export default function (pi: ExtensionAPI) {
           updateJobUi(ctx);
         }
       } finally {
+        // removeListener is always safe and avoids a leaked emitter binding;
+        // the remaining cleanup side effects are already performed by
+        // session_shutdown (which destroys engines, clears the map, and
+        // disposes runner handles), so guard them to avoid double cleanup
+        // and stale teardown against a dying session.
         if (onOutput) runnerRef.removeListener("output", onOutput);
-        engine.destroy();
-        enginesRef.delete(jobID);
-        runnerRef.dispose(jobID);
+        if (!isShuttingDown) {
+          engine.destroy();
+          enginesRef.delete(jobID);
+          runnerRef.dispose(jobID);
+        }
       }
     })().catch(() => {});
 
@@ -329,7 +336,6 @@ export default function (pi: ExtensionAPI) {
   ): Promise<string> {
     const r = registry!;
     const sched = scheduler!;
-    const deliveryRef = delivery!;
     const jobID = r.register("loop", { summary: `every ${Math.floor(intervalMs / 1_000)}s: ${prompt}` });
 
     const cfg: LoopConfig = {
