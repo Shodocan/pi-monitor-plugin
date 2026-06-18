@@ -295,11 +295,12 @@ git commit -m "feat: add monitor job UI formatting"
 ### Task 2: Process exit result with code and signal
 
 **Parallel:** after Task 1
-**Touches:** `src/runner/process-runner.ts`, `test/process-runner.test.ts`
+**Touches:** `src/runner/process-runner.ts`, `test/process-runner.test.ts`, `extensions/pi-monitor.ts`
 
 **Files:**
 - Modify: `src/runner/process-runner.ts`
 - Modify: `test/process-runner.test.ts`
+- Modify: `extensions/pi-monitor.ts` (type annotation compatibility only)
 
 - [ ] **Step 1: Write failing process-exit tests**
 
@@ -391,18 +392,35 @@ run(jobID: string, command: string): { jobID: string; exitPromise: Promise<Proce
 }
 ```
 
-- [ ] **Step 4: Run focused tests**
+- [ ] **Step 4: Update extension type annotations for compatibility**
+
+Modify `extensions/pi-monitor.ts` imports and local variables only:
+
+```ts
+import type { OutputEvent, JobRecord, ProcessExit } from '../src/types.ts';
+```
+
+Replace both monitor/background declarations:
+
+```ts
+let exitPromise: Promise<ProcessExit>;
+```
+
+Do not change runtime behavior in this task.
+
+- [ ] **Step 5: Run focused tests**
 
 ```bash
 npm test -- test/process-runner.test.ts
+npm run typecheck
 ```
 
 Expected: pass.
 
-- [ ] **Step 5: Commit Task 2**
+- [ ] **Step 6: Commit Task 2**
 
 ```bash
-git add src/runner/process-runner.ts test/process-runner.test.ts
+git add src/runner/process-runner.ts test/process-runner.test.ts extensions/pi-monitor.ts
 git commit -m "feat: expose process exit result"
 ```
 
