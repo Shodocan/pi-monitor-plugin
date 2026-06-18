@@ -14,8 +14,19 @@ export interface OutputEvent {
   timestamp: number;
 }
 
+/** Optional display metadata for a job record. */
+export interface JobMetadata {
+  summary?: string;
+}
+
+/** Process exit result (code and signal). */
+export interface ProcessExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
 /** Persistent job record — owns sessionID directly. */
-export interface JobRecord {
+export interface JobRecord extends JobMetadata {
   jobID: string;
   kind: JobKind;
   state: JobState;

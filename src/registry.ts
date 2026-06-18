@@ -1,4 +1,4 @@
-import type { JobKind, JobRecord, JobState } from './types.ts';
+import type { JobKind, JobMetadata, JobRecord, JobState } from './types.ts';
 import { MAX_ACTIVE_JOBS, MAX_COMPLETED_RETENTION } from './limits.ts';
 
 export class JobRegistry {
@@ -25,7 +25,7 @@ export class JobRegistry {
    *
    * @throws `Error: max active jobs (20)` when limit is reached.
    */
-  register(kind: JobKind): string {
+  register(kind: JobKind, metadata: JobMetadata = {}): string {
     if (this.#active.size >= MAX_ACTIVE_JOBS) {
       throw new Error(`max active jobs (${MAX_ACTIVE_JOBS})`);
     }
@@ -39,6 +39,7 @@ export class JobRegistry {
       state: 'active',
       sessionID: this.#sessionID,
       createdAt: Date.now(),
+      ...metadata,
     };
 
     this.#active.set(jobID, record);

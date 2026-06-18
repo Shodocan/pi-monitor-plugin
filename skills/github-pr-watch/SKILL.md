@@ -21,22 +21,56 @@ to authenticate on their behalf.
 ## Start watching
 
 1. **Resolve scope.**
-   - User said "this repo" (or you are inside the repo they mean): run
-     `gh repo view --json nameWithOwner -q .nameWithOwner` in the cwd and use scoped mode.
-   - User said "my PRs" / "everything" / gave no repo: use cross-repo mode (no `--repo`).
-2. **Pick the interval.** Default 300 seconds; honor phrasing like "every 2 minutes"
-   (minimum 60 — `gh search` indexing lag makes faster polling pointless).
-3. **Start the monitor.** The watcher script lives in this skill directory at
-   `scripts/watch-prs.sh` — use its absolute path:
+   - User said "this repo" or you are inside a repo: run
+     `gh repo view --json nameWithOwner -q .nameWithOwner` and use `--repo <owner/name>`.
+   - User said "my PRs", "everything", or gave no repo: use cross-repo mode without `--repo`.
+2. **Pick interval.** Default 300 seconds. Minimum practical interval is 60 seconds because `gh search` indexing may lag.
+3. **Start monitor.** Use the absolute script path from this skill directory.
 
-   ```
-   /monitor --regex '^PI_EVENT ' -- <this-skill-dir>/scripts/watch-prs.sh --interval 300 --repo <owner/name>
-   ```
+### Slash examples
 
-   Cross-repo mode: same command without `--repo`. Optional flags: `--include-drafts`,
-   `--include-bots` (bot PRs like dependabot are skipped by default).
-4. **Confirm to the user**, e.g.: "Watching <scope> for review requests every 5 min — I'll
-   summarize new PRs and ask before reviewing. `/jobs` to inspect, `/cancel <id>` to stop."
+Watch review requests across all repos every 5 minutes:
+
+```text
+/monitor --regex '^PI_EVENT ' -- <skill-dir>/scripts/watch-prs.sh --interval 300
+```
+
+Watch one repo:
+
+```text
+/monitor --regex '^PI_EVENT ' -- <skill-dir>/scripts/watch-prs.sh --interval 300 --repo acme-org/example-service
+```
+
+Include drafts or bot-authored PRs:
+
+```text
+/monitor --regex '^PI_EVENT ' -- <skill-dir>/scripts/watch-prs.sh --interval 300 --include-drafts --include-bots
+```
+
+### Tool example
+
+Pass `jobs_monitor` params directly:
+
+```json
+{
+  "command": "<skill-dir>/scripts/watch-prs.sh --interval 300 --repo acme-org/example-service",
+  "regex": "^PI_EVENT ",
+  "before": 0,
+  "after": 0,
+  "debounceSeconds": 5,
+  "deliver": "polite"
+}
+```
+
+### Parameter cheat sheet
+
+- `--repo owner/name` — limit watch to one repository; omit for all repos.
+- `--interval seconds` — polling interval; default `300`.
+- `--include-drafts` — include draft PRs; skipped by default.
+- `--include-bots` — include bot authors like Dependabot; skipped by default.
+- `--once` — single poll for testing; do not use for a long-running monitor.
+
+After starting, tell the user: "Watching <scope> every <interval>; `/jobs` shows active monitors and `/cancel <jobID>` stops it."
 
 ## When an event arrives
 
@@ -55,9 +89,15 @@ report the count once, do not enumerate them unless asked.
 
 ## Stop watching
 
-`/jobs` to find the monitor's job ID, then `/cancel <jobID>`. Watcher state (seen PR ids)
-lives under `~/.local/state/pi-monitor/watch-prs/` and may be deleted freely — the only
-consequence is a fresh baseline.
+Run `/jobs`, find the `mon_*` job, then `/cancel <jobID>`.
+
+```text
+/jobs
+/cancel mon_1
+```
+
+Watcher state (seen PR ids) lives under `~/.local/state/pi-monitor/watch-prs/` and may be
+deleted freely — the only consequence is a fresh baseline.
 
 ## Testing the pipeline
 

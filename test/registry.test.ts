@@ -212,4 +212,19 @@ describe('JobRegistry', () => {
     reg.fail(ids[1]);
     expect(reg.activeCount).toBe(2);
   });
+
+  // -- Optional display metadata --------------------------------
+
+  it('stores optional display summary for active jobs', () => {
+    const r = new JobRegistry('session-1');
+
+    const jobID = r.register('mon', { summary: 'watch-prs.sh --interval 300' });
+
+    expect(r.get(jobID)).toMatchObject({
+      jobID,
+      kind: 'mon',
+      state: 'active',
+      summary: 'watch-prs.sh --interval 300',
+    });
+  });
 });

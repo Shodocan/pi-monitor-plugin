@@ -15,7 +15,8 @@ import { PromptScheduler } from "../src/scheduler.ts";
 import type { DeliveryCallback, LoopConfig, ScheduleConfig, PromptSchedulerRequest } from "../src/scheduler.ts";
 import { parseBackground, parseMonitor, parseLoop, parseSchedule } from "../src/parser/index.ts";
 import { DeliveryService } from "../src/delivery.ts";
-import type { OutputEvent, JobRecord } from "../src/types.ts";
+import type { OutputEvent, JobRecord, ProcessExit } from "../src/types.ts";
+import { formatJobStatus, formatJobWidget } from "../src/ui.ts";
 import { formatJobs, formatCancel } from "../src/delivery-format.ts";
 import {
   MIN_LOOP_INTERVAL_MS,
@@ -23,6 +24,7 @@ import {
   MIN_MONITOR_DEBOUNCE_S,
   MAX_MONITOR_DEBOUNCE_S,
   MAX_REGEX_PATTERN_LENGTH,
+  MONITOR_PER_DELIVERY_CAP_BYTES,
 } from "../src/limits.ts";
 
 const MAX_MONITOR_CONTEXT_LINES = 200;
@@ -83,8 +85,84 @@ export default function (pi: ExtensionAPI) {
   let engines: Map<string, MonitorEngine> | null = null;
   let scheduler: PromptScheduler | null = null;
   let delivery: DeliveryService | null = null;
+  let isShuttingDown = false;
+  let activeCtx: ExtensionContext | null = null;
+
+  /** Push current active-job summary to the TUI footer + widget. */
+  function updateJobUi(ctx: ExtensionContext): void {
+    if (!ctx.hasUI || !registry || isShuttingDown) return;
+    const activeJobs = registry.active();
+    ctx.ui.setStatus("pi-monitor", formatJobStatus(activeJobs));
+    ctx.ui.setWidget("pi-monitor", formatJobWidget(activeJobs));
+  }
+
+  /** Best-effort UI cleanup (called during teardown). */
+  function clearJobUi(): void {
+    const ctx = activeCtx;
+    if (!ctx?.hasUI) return;
+    try {
+      ctx.ui.setStatus("pi-monitor", undefined);
+      ctx.ui.setWidget("pi-monitor", undefined);
+    } catch {
+      // Session may already be tearing down; UI cleanup is best-effort.
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Monitor exit helpers                                               */
+  /* ---------------------------------------------------------------- */
+
+  const MONITOR_EXIT_HEADROOM_BYTES = 1024;
+
+  function isCleanExit(exit: ProcessExit): boolean {
+    return exit.code === 0 && exit.signal === null;
+  }
+
+  function exitReason(exit: ProcessExit): string {
+    if (exit.signal) return `signal ${exit.signal}`;
+    return `exit code ${exit.code ?? 'unknown'}`;
+  }
+
+  function capRecentOutput(tail: string): string {
+    const maxBytes = Math.max(0, MONITOR_PER_DELIVERY_CAP_BYTES - MONITOR_EXIT_HEADROOM_BYTES);
+    const bytes = Buffer.from(tail, 'utf8');
+    if (bytes.length <= maxBytes) return tail;
+    return `[truncated recent output to ${maxBytes} bytes]\n${bytes.subarray(bytes.length - maxBytes).toString('utf8')}`;
+  }
+
+  function monitorExitContent(jobID: string, exit: ProcessExit, tail: string): string {
+    const headline = isCleanExit(exit)
+      ? `${jobID} monitor stopped (${exitReason(exit)}); no longer watching.`
+      : `${jobID} monitor died (${exitReason(exit)}); no longer watching.`;
+    const cappedTail = capRecentOutput(tail);
+    return cappedTail.length > 0 ? `${headline}\n\nRecent output:\n${cappedTail}` : headline;
+  }
+
+  function notifyMonitorExit(
+    ctx: ExtensionContext,
+    deliveryRef: DeliveryService,
+    jobID: string,
+    exit: ProcessExit,
+    tail: string,
+  ): void {
+    if (isShuttingDown) return;
+    const clean = isCleanExit(exit);
+    const label = clean ? `${jobID} monitor stopped` : `${jobID} monitor died`;
+    if (ctx.hasUI) ctx.ui.notify(label, clean ? 'warning' : 'error');
+
+    deliveryRef.deliver(pi, ctx, {
+      jobID,
+      kind: 'mon',
+      content: monitorExitContent(jobID, exit, tail),
+      urgency: clean ? 'polite' : 'interrupt',
+      isProcessOutput: true,
+      isLoopTick: false,
+    });
+  }
 
   pi.on("session_start", async (_event, ctx) => {
+    isShuttingDown = false;
+    activeCtx = ctx;
     registry = new JobRegistry(ctx.sessionManager.getSessionId());
     runner = new ProcessRunner();
     engines = new Map();
@@ -95,21 +173,36 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     };
     scheduler = new PromptScheduler({ delivery: deliveryCb });
-    ctx.ui.setStatus("pi-monitor", "jobs idle");
+    updateJobUi(ctx);
   });
 
   pi.on("session_shutdown", async () => {
+    // Guard against stale-session emissions before tearing anything down.
+    isShuttingDown = true;
+    clearJobUi();
+
     // 1. Cancel all active scheduler jobs (loops + one-shot)
     if (scheduler) {
       scheduler.destroy();
       scheduler = null;
     }
 
-    // 2. Dispose all runner processes
+    // 2. Cancel active runner processes (SIGTERM → SIGKILL), then dispose
     if (registry && runner) {
-      for (const job of registry.active()) {
-        runner.dispose(job.jobID);
+      const activeRunnerJobs = registry.active().filter(
+        (job) => job.kind === 'bg' || job.kind === 'mon',
+      );
+      for (const job of activeRunnerJobs) {
+        try {
+          registry.cancel(job.jobID);
+        } catch {
+          // Already completed/cancelled; shutdown continues.
+        }
       }
+      await Promise.allSettled(
+        activeRunnerJobs.map((job) => runner!.cancel(job.jobID)),
+      );
+      for (const job of activeRunnerJobs) runner.dispose(job.jobID);
     }
 
     // 3. Destroy all monitor engines
@@ -129,6 +222,7 @@ export default function (pi: ExtensionAPI) {
     engines = null;
     runner = null;
     registry = null;
+    activeCtx = null;
   });
 
   pi.on("turn_end", async (_event, ctx) => {
@@ -151,8 +245,8 @@ export default function (pi: ExtensionAPI) {
     const r = registry!;
     const runnerRef = runner!;
     const deliveryRef = delivery!;
-    const jobID = r.register("bg");
-    let exitPromise: Promise<number | null>;
+    const jobID = r.register("bg", { summary: command });
+    let exitPromise: Promise<ProcessExit>;
     try {
       ({ exitPromise } = runnerRef.run(jobID, command));
     } catch (error) {
@@ -160,10 +254,18 @@ export default function (pi: ExtensionAPI) {
       throw error;
     }
 
+    updateJobUi(ctx);
+
     (async () => {
       try {
         await exitPromise;
+        // Once shutdown begins the session owns teardown: it has already
+        // cancelled/disposed this process and is tearing down delivery. Bail
+        // out before reading tail or delivering so stale buffered output is
+        // never pushed to a dying session (and we avoid a double dispose).
+        if (isShuttingDown) return;
         r.complete(jobID);
+        updateJobUi(ctx);
         const tail = runnerRef.tail(jobID, "stdout")
           .concat(runnerRef.tail(jobID, "stderr"))
           .join("\n");
@@ -178,9 +280,14 @@ export default function (pi: ExtensionAPI) {
           });
         }
       } catch {
-        r.fail(jobID);
+        if (!isShuttingDown) {
+          r.fail(jobID);
+          updateJobUi(ctx);
+        }
       } finally {
-        runnerRef.dispose(jobID);
+        if (!isShuttingDown) {
+          runnerRef.dispose(jobID);
+        }
       }
     })().catch(() => {});
 
@@ -202,10 +309,10 @@ export default function (pi: ExtensionAPI) {
     const deliveryRef = delivery!;
     await vetRegexPattern(regex.source, regex.flags);
 
-    const jobID = r.register("mon");
+    const jobID = r.register("mon", { summary: `${regex.toString()} -- ${command}` });
     let engine: MonitorEngine | null = null;
     let onOutput: ((event: OutputEvent) => void) | null = null;
-    let exitPromise: Promise<number | null>;
+    let exitPromise: Promise<ProcessExit>;
     try {
       engine = new MonitorEngine({
         jobID,
@@ -214,6 +321,7 @@ export default function (pi: ExtensionAPI) {
         after,
         debounceMs,
         onWindow: (window) => {
+          if (isShuttingDown || r.get(jobID)?.state !== "active") return;
           const lines = window.events.map((e) => e.line).join("\n");
           deliveryRef.deliver(pi, ctx, {
             jobID,
@@ -241,13 +349,37 @@ export default function (pi: ExtensionAPI) {
     };
     runnerRef.on("output", onOutput);
 
+    updateJobUi(ctx);
+
     (async () => {
       try {
-        await exitPromise;
+        const exit = await exitPromise;
+
+        if (isShuttingDown) return;
+
+        const latest = r.get(jobID);
+        const wasStillActive = latest?.state === "active";
+        if (!wasStillActive) return;
+
         engine.flush();
-        r.complete(jobID);
+        if (isShuttingDown) return;
+
+        const tail = runnerRef.tail(jobID, "stdout")
+          .concat(runnerRef.tail(jobID, "stderr"))
+          .join("\n");
+
+        notifyMonitorExit(ctx, deliveryRef, jobID, exit, tail);
+        if (isCleanExit(exit)) {
+          r.complete(jobID);
+        } else {
+          r.fail(jobID);
+        }
+        updateJobUi(ctx);
       } catch {
-        r.fail(jobID);
+        if (!isShuttingDown) {
+          r.fail(jobID);
+          updateJobUi(ctx);
+        }
       } finally {
         if (onOutput) runnerRef.removeListener("output", onOutput);
         engine.destroy();
@@ -266,8 +398,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<string> {
     const r = registry!;
     const sched = scheduler!;
-    const deliveryRef = delivery!;
-    const jobID = r.register("loop");
+    const jobID = r.register("loop", { summary: `every ${Math.floor(intervalMs / 1_000)}s: ${prompt}` });
 
     const cfg: LoopConfig = {
       jobID,
@@ -278,6 +409,7 @@ export default function (pi: ExtensionAPI) {
 
     // Override the scheduler's delivery callback for this loop to include coalescing
     sched.scheduleLoop(cfg);
+    updateJobUi(ctx);
     return `started ${jobID}`;
   }
 
@@ -288,7 +420,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<string> {
     const r = registry!;
     const sched = scheduler!;
-    const jobID = r.register("sched");
+    const jobID = r.register("sched", { summary: `at ${runAt.toISOString()}: ${prompt}` });
 
     const cfg: ScheduleConfig = {
       jobID,
@@ -298,6 +430,7 @@ export default function (pi: ExtensionAPI) {
     };
 
     sched.scheduleOnce(cfg);
+    updateJobUi(ctx);
     return `started ${jobID}`;
   }
 
@@ -397,6 +530,7 @@ export default function (pi: ExtensionAPI) {
     // completion cannot race the registry into a false completed/failed state.
     try {
       r.cancel(jobID);
+      updateJobUi(ctx);
     } catch (error) {
       const latest = r.get(jobID);
       if (latest && latest.state !== "active") {
@@ -440,15 +574,16 @@ export default function (pi: ExtensionAPI) {
       });
       if (req.kind === "sched") {
         registryRef.complete(req.jobID);
+        updateJobUi(ctx);
       }
     } catch (error) {
       if (req.kind === "sched") {
         registryRef.fail(req.jobID);
+        updateJobUi(ctx);
       }
       throw error;
     }
   }
-
   /* ---------------------------------------------------------------- */
   /* Slash command handlers                                            */
   /* ---------------------------------------------------------------- */

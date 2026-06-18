@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import extension from '../extensions/pi-monitor.ts';
+import type { ProcessExit } from '../src/types.ts';
 
 /* ------------------------------------------------------------------ */
 /* Mock helpers                                                       */
@@ -27,6 +28,7 @@ function makeMockContext(): ExtensionContext {
     hasUI: true,
     ui: {
       setStatus: vi.fn(),
+      setWidget: vi.fn(),
       notify: vi.fn(),
       select: vi.fn(),
       confirm: vi.fn(),
@@ -587,4 +589,345 @@ describe('jobs_monitor validation parity with /monitor', () => {
     expect(result.content[0].text).toMatch(/^started mon_/);
     await shutdownSession(api);
   });
+});
+
+/* ------------------------------------------------------------------ */
+/* Tests: TUI status/widget updates (Task 3)                           */
+/* ------------------------------------------------------------------ */
+
+describe('TUI status and widget updates', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  it('updates TUI status and widget while a background job is active', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_background').execute(
+      'call-bg-ui',
+      { command: 'sleep 0.2' },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs bg:1');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith(
+      'pi-monitor',
+      expect.arrayContaining(['pi-monitor jobs', expect.stringContaining(jobID)]),
+    );
+
+    await vi.waitFor(() => expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs idle'));
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith('pi-monitor', undefined);
+    await shutdownSession(api);
+  });
+
+  it('updates TUI status and widget when a monitor job starts and is cancelled', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-ui',
+      { command: 'sleep 60', regex: 'PI_EVENT', debounceSeconds: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs mon:1');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith(
+      'pi-monitor',
+      expect.arrayContaining(['pi-monitor jobs', expect.stringContaining(jobID)]),
+    );
+
+    await tool(api, 'jobs_cancel').execute('cancel-mon-ui', { jobID }, undefined, undefined, ctx);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith('pi-monitor', 'jobs idle');
+    expect(ctx.ui.setWidget).toHaveBeenLastCalledWith('pi-monitor', undefined);
+    await shutdownSession(api);
+  }, 10_000);
+});
+
+/* ------------------------------------------------------------------ */
+/* Tests: background shutdown stale-delivery guard (Task 3 fix)        */
+/* ------------------------------------------------------------------ */
+
+describe('background shutdown stale-delivery guard', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not deliver background output after session_shutdown begins', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+
+    // Controllable exit: keep the process "alive" so its finalizer runs only
+    // once we resolve, strictly after shutdown has started.
+    let resolveExit!: (exit: ProcessExit) => void;
+    const stalledExit = new Promise<ProcessExit>((resolve) => {
+      resolveExit = resolve;
+    });
+    vi.spyOn(ProcessRunner.prototype, 'run').mockImplementation((jobID: string) => ({
+      jobID,
+      exitPromise: stalledExit,
+    }));
+    // Output buffered before shutdown; the buggy finalizer would read this tail
+    // and deliver it to the dying session.
+    vi.spyOn(ProcessRunner.prototype, 'tail').mockReturnValue(['STALE_AFTER_SHUTDOWN']);
+
+    const result = await tool(api, 'jobs_background').execute(
+      'call-bg-stale',
+      { command: 'printf STALE_AFTER_SHUTDOWN' },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content[0].text).toMatch(/^started bg_/);
+
+    // session_shutdown begins: isShuttingDown flips true, delivery is torn down.
+    await shutdownSession(api);
+
+    // The process now exits AFTER shutdown started — the finalizer resumes here.
+    resolveExit({ code: 0, signal: null });
+    // Drain the finalizer microtask.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Stale buffered output must NOT reach the session after shutdown.
+    expect(api.sendMessage).not.toHaveBeenCalled();
+    expect(api.sendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Tests: monitor shutdown stale-delivery guard (Task 3 quality fix)  */
+/* ------------------------------------------------------------------ */
+
+describe('monitor shutdown stale-delivery guard', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not deliver monitor pending output after session_shutdown begins', async () => {
+    await startSession(api, ctx);
+
+    const { ProcessRunner } = await import('../src/runner/process-runner.ts');
+
+    // Controllable exit: keep the process "alive" so the finalizer runs only
+    // once we resolve, strictly after shutdown has started.
+    let resolveExit!: (exit: ProcessExit) => void;
+    const stalledExit = new Promise<ProcessExit>((resolve) => {
+      resolveExit = resolve;
+    });
+    // Capture the runner instance so we can emit a matching output event
+    // that arms a debounce timer inside the engine.
+    let runnerInstance: typeof ProcessRunner.prototype | undefined;
+    vi.spyOn(ProcessRunner.prototype, 'run').mockImplementation(function (
+      this: typeof ProcessRunner.prototype,
+      jobID: string,
+    ) {
+      runnerInstance = this;
+      return { jobID, exitPromise: stalledExit };
+    });
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-stale',
+      {
+        command: 'printf MONITOR_STALE_MATCH',
+        regex: 'MONITOR_STALE_MATCH',
+        before: 0,
+        after: 0,
+        debounceSeconds: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.content[0].text).toMatch(/^started mon_/);
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    // Emit a matching line so the engine queues a ready window and arms the
+    // debounce timer (1s). The onWindow callback would deliver this once the
+    // debounce fires — but we trigger shutdown before that happens.
+    runnerInstance!.emit('output', {
+      jobID,
+      seq: 1,
+      stream: 'stdout',
+      line: 'MONITOR_STALE_MATCH',
+      timestamp: Date.now(),
+    });
+
+    // session_shutdown begins: isShuttingDown flips true, the engine is
+    // destroyed (clearing its debounce timer), delivery is torn down.
+    await shutdownSession(api);
+
+    // Wait past the debounce window to prove the armed timer did not fire.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+    // The process now exits AFTER shutdown started — the finalizer resumes
+    // here and must bail before engine.flush() and skip double cleanup.
+    resolveExit({ code: 0, signal: null });
+    // Drain the finalizer microtask.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Stale monitor output must NOT reach the session after shutdown.
+    // Assert no sendMessage / sendUserMessage payload includes the match text
+    // or any monitor stopped/died notification.
+    const sendCalls = (api.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
+    for (const call of sendCalls) {
+      const payload = JSON.stringify(call);
+      expect(payload).not.toContain('MONITOR_STALE_MATCH');
+      expect(payload).not.toMatch(/monitor (stopped|died)/i);
+    }
+    const userCalls = (api.sendUserMessage as ReturnType<typeof vi.fn>).mock.calls;
+    for (const call of userCalls) {
+      const payload = JSON.stringify(call);
+      expect(payload).not.toContain('MONITOR_STALE_MATCH');
+      expect(payload).not.toMatch(/monitor (stopped|died)/i);
+    }
+  }, 10_000);
+});
+
+/* ------------------------------------------------------------------ */
+/* Tests: monitor exit notifications (Task 4)                          */
+/* ------------------------------------------------------------------ */
+
+describe('monitor exit notifications', () => {
+  let api: ExtensionAPI;
+  let ctx: ExtensionContext;
+
+  beforeEach(() => {
+    api = makeMockApi();
+    ctx = makeMockContext();
+    extension(api);
+  });
+
+  it('notifies when a monitor exits normally without being cancelled', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-stopped',
+      { command: 'sh -c "sleep 0.1; exit 0"', regex: 'NEVER_MATCHES', debounceSeconds: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    await vi.waitFor(() => {
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining(`${jobID} monitor stopped`), 'warning');
+    });
+
+    expect(api.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: 'pi-monitor', content: expect.stringContaining('monitor stopped'), display: true }),
+      { triggerTurn: true },
+    );
+
+    await shutdownSession(api);
+  });
+
+  it('notifies when a monitor dies with a non-zero exit and caps recent output', async () => {
+    await startSession(api, ctx);
+    const noisy = "node -e \"console.error('x'.repeat(20000)); process.exit(7)\"";
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-died',
+      { command: noisy, regex: 'NEVER_MATCHES', debounceSeconds: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+
+    await vi.waitFor(() => {
+      expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining(`${jobID} monitor died`), 'error');
+    });
+
+    const message = vi.mocked(api.sendMessage).mock.calls.find(([payload]) => {
+      return typeof payload.content === 'string' && payload.content.includes('monitor died');
+    });
+
+    expect(message?.[0]).toMatchObject({ customType: 'pi-monitor', display: true });
+    expect(message?.[0].content).toContain('exit code 7');
+    expect(Buffer.byteLength(String(message?.[0].content), 'utf8')).toBeLessThanOrEqual(17 * 1024);
+
+    await shutdownSession(api);
+  });
+
+  it('does not send monitor output or death notification after explicit cancel', async () => {
+    await startSession(api, ctx);
+
+    const result = await tool(api, 'jobs_monitor').execute(
+      'call-mon-cancel-no-death',
+      { command: 'printf "MATCH_BEFORE_CANCEL\\n"; sleep 60', regex: 'MATCH_BEFORE_CANCEL', before: 0, after: 0, debounceSeconds: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    const jobID = (result.content[0].text as string).match(/started (\S+)/)![1];
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tool(api, 'jobs_cancel').execute('cancel-no-death', { jobID }, undefined, undefined, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    const allMessages = [
+      ...vi.mocked(ctx.ui.notify).mock.calls.map((call) => String(call[0])),
+      ...vi.mocked(api.sendMessage).mock.calls.map((call) => String(call[0].content)),
+    ].join('\n');
+
+    expect(allMessages).not.toContain('monitor died');
+    expect(allMessages).not.toContain('monitor stopped');
+    expect(allMessages).not.toContain('MATCH_BEFORE_CANCEL');
+    await shutdownSession(api);
+  }, 10_000);
+
+  it('does not send monitor output or death notification during session shutdown', async () => {
+    await startSession(api, ctx);
+
+    await tool(api, 'jobs_monitor').execute(
+      'call-mon-shutdown-no-death',
+      { command: 'printf "MATCH_BEFORE_SHUTDOWN\\n"; sleep 60', regex: 'MATCH_BEFORE_SHUTDOWN', before: 0, after: 0, debounceSeconds: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await shutdownSession(api);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    const allMessages = [
+      ...vi.mocked(ctx.ui.notify).mock.calls.map((call) => String(call[0])),
+      ...vi.mocked(api.sendMessage).mock.calls.map((call) => String(call[0].content)),
+    ].join('\n');
+
+    expect(allMessages).not.toContain('monitor died');
+    expect(allMessages).not.toContain('monitor stopped');
+    expect(allMessages).not.toContain('MATCH_BEFORE_SHUTDOWN');
+  }, 10_000);
 });

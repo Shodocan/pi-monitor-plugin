@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import type { OutputEvent } from '../src/types.ts';
+import type { OutputEvent, ProcessExit } from '../src/types.ts';
 import { ProcessRunner } from '../src/runner/process-runner.ts';
 import { PROCESS_OUTPUT_CAP_BYTES, PROCESS_OUTPUT_CAP_LINES } from '../src/limits.ts';
 
@@ -23,10 +23,10 @@ function waitForOutput(runner: ProcessRunner, jobID: string, maxLines = 4): Prom
   });
 }
 
-function waitForExit(runner: ProcessRunner, jobID: string, exitPromise: Promise<number | null>): Promise<number | null> {
-  return exitPromise.then((code) => {
+function waitForExit(runner: ProcessRunner, jobID: string, exitPromise: Promise<ProcessExit>): Promise<ProcessExit> {
+  return exitPromise.then((result) => {
     runner.dispose(jobID);
-    return code;
+    return result;
   });
 }
 
@@ -50,15 +50,16 @@ describe('ProcessRunner', () => {
   it('spawns with /bin/sh -c and detached group', async () => {
     const id = 'pr_1';
     const { exitPromise } = runner.run(id, 'echo hello');
-    const code = await waitForExit(runner, id, exitPromise);
-    expect(code).toBe(0);
+    const result = await waitForExit(runner, id, exitPromise);
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
   });
 
   it('creates exit promise before listeners — no race for fast commands', async () => {
     const id = 'pr_fast';
     const { exitPromise } = runner.run(id, 'true');
     const p = Promise.race([
-      exitPromise.then((v) => v),
+      exitPromise.then((v) => v.code),
       new Promise<number>((r) => setTimeout(() => r(-1), 2000)),
     ]);
     const code = await p;
@@ -69,6 +70,24 @@ describe('ProcessRunner', () => {
   it('rejects duplicate jobID', () => {
     runner.run('dup', 'echo 1');
     expect(() => runner.run('dup', 'echo 2')).toThrow('already running');
+  });
+
+  it('resolves ProcessExit with non-zero exit code and null signal for natural failure', async () => {
+    const id = 'pr_nonzero';
+    const { exitPromise } = runner.run(id, 'exit 42');
+    const result = await waitForExit(runner, id, exitPromise);
+    expect(result.code).toBe(42);
+    expect(result.signal).toBeNull();
+  });
+
+  it('resolves ProcessExit with null code and a signal when cancelled', async () => {
+    const id = 'pr_cancel';
+    const { exitPromise } = runner.run(id, 'sleep 30');
+    // Cancel the running process
+    await runner.cancel(id);
+    const result = await exitPromise;
+    expect(result.code).toBeNull();
+    expect(result.signal).not.toBeNull();
   });
 
   // -- Output events -------------------------------------------

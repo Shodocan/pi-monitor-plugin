@@ -6,7 +6,7 @@ import {
   PROCESS_OUTPUT_CAP_BYTES,
   PROCESS_OUTPUT_CAP_LINES,
 } from '../limits.ts';
-import type { OutputEvent, OutputStream } from '../types.ts';
+import type { OutputEvent, OutputStream, ProcessExit } from '../types.ts';
 
 // ----------------------------------------------------------------
 // Errors
@@ -67,7 +67,7 @@ export interface ProcessRunnerEvents {
 
 interface ProcessHandle {
   process: ChildProcess;
-  exitPromise: Promise<number | null>;
+  exitPromise: Promise<ProcessExit>;
   cancelPending: boolean;
   cancelled: boolean;
 }
@@ -87,7 +87,7 @@ export class ProcessRunner extends EventEmitter {
    * - Output is emitted as `OutputEvent` lines; trailing empty-lines are dropped.
    * - Rolling tails enforce per-stream caps while streams keep draining.
    */
-  run(jobID: string, command: string): { jobID: string; exitPromise: Promise<number | null> } {
+  run(jobID: string, command: string): { jobID: string; exitPromise: Promise<ProcessExit> } {
     if (this.#handles.has(jobID)) {
       throw new ProcessRunnerError(`job ${jobID} already running`);
     }
@@ -101,9 +101,9 @@ export class ProcessRunner extends EventEmitter {
     // Create the exit promise BEFORE attaching any listeners — avoids the
     // "fast process exits before handler attached" race. Use `close`, not
     // `exit`, so stdout/stderr have ended and final partial lines are flushed.
-    const exitPromise = new Promise<number | null>((resolve) => {
+    const exitPromise = new Promise<ProcessExit>((resolve) => {
       child.once('close', (code, signal) => {
-        resolve(code);
+        resolve({ code, signal });
       });
     });
 
@@ -175,7 +175,7 @@ export class ProcessRunner extends EventEmitter {
 
   // -- Internal --------------------------------------------------
 
-  #onSpawn(jobID: string, child: ChildProcess, exitPromise: Promise<number | null>): void {
+  #onSpawn(jobID: string, child: ChildProcess, exitPromise: Promise<ProcessExit>): void {
     const tails = new Map<OutputStream, TailBuffer>([
       ['stdout', new TailBuffer(PROCESS_OUTPUT_CAP_LINES, PROCESS_OUTPUT_CAP_BYTES)],
       ['stderr', new TailBuffer(PROCESS_OUTPUT_CAP_LINES, PROCESS_OUTPUT_CAP_BYTES)],
